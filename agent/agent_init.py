@@ -257,6 +257,66 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+class _HFLocalClientShim:
+    """OpenAI-compatible shim that routes generate calls to HFWorkerPool.
+
+    Presents the same interface that run_agent.py uses for chat_completions:
+        client.chat.completions.create(**kwargs)
+
+    Returns a _HFLocalResponse object that HFLocalTransport.normalize_response
+    knows how to unwrap.
+    """
+
+    class _Completions:
+        def __init__(self, pool, model: str):
+            self._pool  = pool
+            self._model = model
+
+        def create(self, *, model=None, messages=None, tools=None, **kwargs):
+            from agent.hf_local.pool import _load_hf_config
+            cfg = _load_hf_config()
+            capture = cfg.get("profiling_enabled", False)
+
+            temperature = kwargs.get("temperature") or 0.0
+            max_new_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or None
+
+            text, usage, timings, probe_rows = self._pool.generate(
+                messages or [],
+                model_type="llm",
+                sampling={"temperature": temperature, "max_new_tokens": max_new_tokens},
+                capture=capture,
+            )
+            return _HFLocalResponse(text=text, usage=usage, timings=timings, probe_rows=probe_rows)
+
+    class _Chat:
+        def __init__(self, pool, model: str):
+            self.completions = _HFLocalClientShim._Completions(pool, model)
+
+    def __init__(self, pool, model: str):
+        self._pool = pool
+        self._model = model
+        self.chat = _HFLocalClientShim._Chat(pool, model)
+        self.base_url = "hf://local"
+
+    def __repr__(self) -> str:
+        return f"<HFLocalClientShim model={self._model!r}>"
+
+
+class _HFLocalResponse:
+    """Fake response object returned by HFLocalClientShim.
+
+    HFLocalTransport.normalize_response checks for _hf_local=True to
+    unwrap this instead of treating it as a standard OpenAI response.
+    """
+
+    def __init__(self, *, text: str, usage: dict, timings: dict, probe_rows: list):
+        self._hf_local  = True
+        self.text       = text
+        self.usage      = usage
+        self.timings    = timings
+        self.probe_rows = probe_rows
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -862,6 +922,20 @@ def init_agent(
         agent.base_url = "moa://local"
         if not agent.quiet_mode:
             print(f"🤖 AI Agent initialized with MoA preset: {agent.model}")
+    elif agent.api_mode == "hf_local":
+        # In-process HuggingFace backend — pool lives in worker processes.
+        # All heavy imports (torch/transformers) are deferred to pool.py
+        # which spawns per-GPU worker processes; the parent process is clean.
+        from agent.hf_local.pool import get_pool as _get_hf_pool
+        _hf_pool = _get_hf_pool()
+        agent._hf_pool = _hf_pool
+        # Expose a chat.completions-like shim so the normal inference loop
+        # can call client.chat.completions.create(**kwargs) unchanged.
+        agent.client = _HFLocalClientShim(_hf_pool, agent.model or "")
+        agent.api_key = "hf-local-no-key"
+        agent._client_kwargs = {}
+        if not agent.quiet_mode:
+            print(f"🤖 AI Agent initialized with HF-local backend: {agent.model}")
     elif agent.api_mode == "bedrock_converse":
         # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
         # Region is extracted from the base_url or defaults to us-east-1.

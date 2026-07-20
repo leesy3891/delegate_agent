@@ -340,6 +340,8 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # In-process HuggingFace backend (gated by hf_local.enabled).
+    "hf_local",
 }
 
 
@@ -1532,6 +1534,25 @@ def resolve_runtime_provider(
             "base_url": "moa://local",
             "api_key": "moa-virtual-provider",
             "source": "moa-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    if requested_provider == "hf-local":
+        # In-process HuggingFace backend — no remote credentials required.
+        # Pool startup and model loading are gated by hf_local.enabled in config.
+        _hf_model = ""
+        try:
+            from hermes_cli.config import load_config as _lc
+            _hf_model = str((_lc().get("hf_local") or {}).get("llm", {}).get("model", "") or "")
+        except Exception:
+            pass
+        return {
+            "provider": "hf-local",
+            "api_mode": "hf_local",
+            "base_url": "hf://local",
+            "api_key":  "hf-local-no-key",
+            "model":    _hf_model or None,
+            "source":   "hf-local-virtual-provider",
             "requested_provider": requested_provider,
         }
 

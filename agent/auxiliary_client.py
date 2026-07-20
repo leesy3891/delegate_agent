@@ -6368,6 +6368,70 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
     return value
 
 
+def _call_hf_local_aux(
+    task: str,
+    messages: list,
+    model: Optional[str],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+) -> Any:
+    """Route an auxiliary call to HFWorkerPool.
+
+    Returns a minimal response object with .choices[0].message.content
+    (compatible with downstream consumers in auxiliary_client that read
+    the completion text from the response).
+
+    Vision tasks route to the VLM slot; all others use the LLM slot.
+    Heavy imports (torch/transformers) stay inside worker processes.
+    """
+    from agent.hf_local.pool import get_pool as _get_hf_pool, _load_hf_config
+
+    pool = _get_hf_pool()
+    cfg  = _load_hf_config()
+    capture = cfg.get("profiling_enabled", False)
+
+    model_type = "vlm" if task == "vision" else "llm"
+
+    text, usage, timings, probe_rows = pool.generate(
+        messages,
+        model_type=model_type,
+        sampling={
+            "temperature":  float(temperature or 0.0),
+            "max_new_tokens": max_tokens,
+        },
+        capture=capture,
+        meta={"tool": task or ""},
+    )
+
+    # Build a minimal response object that auxiliary consumers can read
+    class _Msg:
+        def __init__(self, content):
+            self.content   = content
+            self.tool_calls = None
+            self.role      = "assistant"
+
+    class _Choice:
+        def __init__(self, content):
+            self.message       = _Msg(content)
+            self.finish_reason = "stop"
+
+    class _Usage:
+        def __init__(self, u):
+            self.prompt_tokens     = u.get("prompt_tokens", 0)
+            self.completion_tokens = u.get("completion_tokens", 0)
+            self.total_tokens      = u.get("total_tokens", 0)
+
+    class _Resp:
+        def __init__(self, text, usage):
+            self.choices = [_Choice(text)]
+            self.usage   = _Usage(usage)
+            self._hf_local   = True
+            self._hf_timings = timings
+            self._hf_probe_rows = probe_rows
+
+    return _Resp(text, usage)
+
+
 def call_llm(
     task: str = None,
     *,
@@ -6425,6 +6489,18 @@ def call_llm(
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+
+    # HF-local backend: route to in-process HFWorkerPool instead of SDK client.
+    # Only active when auxiliary.<task>.provider: hf-local is configured.
+    # No torch/transformers imported in this module; all loading is in worker processes.
+    if resolved_provider == "hf-local":
+        return _call_hf_local_aux(
+            task=task,
+            messages=messages,
+            model=resolved_model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(

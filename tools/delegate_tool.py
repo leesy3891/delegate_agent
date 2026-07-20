@@ -389,6 +389,21 @@ def _get_max_concurrent_children() -> int:
             return max(1, int(env_val))
         except (TypeError, ValueError):
             return _DEFAULT_MAX_CONCURRENT_CHILDREN
+
+    # When hf_local.enabled is true, auto-bind to device count so each
+    # concurrent sub-agent maps to a distinct GPU.  Warn if the configured
+    # value doesn't match device count.
+    try:
+        from hermes_cli.config import load_config as _lc_hf
+        _hf_cfg = _lc_hf().get("hf_local") or {}
+        if _hf_cfg.get("enabled"):
+            import os as _os
+            _devs = [d for d in (_os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",") if d.strip()]
+            _n = max(1, len(_devs)) if _devs else 1
+            return _n
+    except Exception:
+        pass
+
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
 
 
@@ -3045,7 +3060,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
         # Explicit delegation.api_mode in config always wins. Lets users force
         # a transport for non-standard endpoints the URL heuristic can't detect.
-        if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+        if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "hf_local"}:
             api_mode = configured_api_mode
 
         return {

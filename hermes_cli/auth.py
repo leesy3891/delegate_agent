@@ -442,6 +442,15 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("AZURE_FOUNDRY_API_KEY",),
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
+    # In-process HuggingFace backend — no remote credentials needed.
+    # Resolved by resolve_runtime_provider() before this registry is checked.
+    "hf-local": ProviderConfig(
+        id="hf-local",
+        name="HF Local (in-process)",
+        auth_type="api_key",
+        inference_base_url="hf://local",
+        api_key_env_vars=(),
+    ),
 }
 
 # Auto-extend PROVIDER_REGISTRY with any api-key provider registered in

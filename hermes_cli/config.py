@@ -2188,6 +2188,38 @@ DEFAULT_CONFIG = {
         "subagent_auto_approve": False,
     },
 
+    # ---------------------------------------------------------------------------
+    # In-process HuggingFace backend (gated: disabled by default)
+    # Set hf_local.enabled: true in config.yaml to activate.
+    # When disabled, no torch/transformers are imported and no GPU resources used.
+    # ---------------------------------------------------------------------------
+    "hf_local": {
+        "enabled": False,
+        "dtype": "bfloat16",
+        "attn_implementation": "eager",
+        "llm": {
+            "model": "Qwen/Qwen3.5-9B",
+            "max_new_tokens": 2048,
+        },
+        "vlm": {
+            "model": "Qwen/Qwen3-VL-8B-Instruct",
+            "lazy": True,
+        },
+    },
+
+    # ---------------------------------------------------------------------------
+    # KV/attention profiling (gated: disabled by default)
+    # Requires hf_local.enabled: true. Writes logs/ and profiling/ per turn.
+    # ---------------------------------------------------------------------------
+    "profiling": {
+        "enabled": False,
+        # "output_contribution": Σ_{q∈group(k)} softmax(QKᵀ/√d)·V_k·W_O^{(q)}
+        # "value_projection":    mean_q(V_k·W_O^{(q)}) — unweighted V→O
+        "probe_mode": "output_contribution",
+        # Decode-phase aggregation window (tokens)
+        "decode_window": 64,
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
