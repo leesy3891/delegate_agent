@@ -6384,13 +6384,32 @@ def _call_hf_local_aux(
     Vision tasks route to the VLM slot; all others use the LLM slot.
     Heavy imports (torch/transformers) stay inside worker processes.
     """
+    import uuid as _uuid
+
     from agent.hf_local.pool import get_pool as _get_hf_pool, _load_hf_config
+    from agent.interp.schemas import InferenceRecord
+    from agent.interp.session_recorder import get_current_turn_id, get_recorder
 
     pool = _get_hf_pool()
     cfg  = _load_hf_config()
     capture = cfg.get("profiling_enabled", False)
 
     model_type = "vlm" if task == "vision" else "llm"
+    resolved_model = model or (cfg.get("vlm_model") if model_type == "vlm" else cfg.get("llm_model"))
+
+    recorder = get_recorder()
+    turn_id  = get_current_turn_id()
+    request_id = str(_uuid.uuid4())
+    call_order = recorder.next_call_order(turn_id) if turn_id else 0
+
+    meta = {
+        "request_id":     request_id,
+        "call_order":     call_order,
+        "parallel_group": "",
+        "is_parallel":    False,
+        "tool":           task or "",
+        "model":          resolved_model or "",
+    }
 
     text, usage, timings, probe_rows = pool.generate(
         messages,
@@ -6400,8 +6419,38 @@ def _call_hf_local_aux(
             "max_new_tokens": max_tokens,
         },
         capture=capture,
-        meta={"tool": task or ""},
+        meta=meta,
     )
+
+    try:
+        from agent.transports.hf_local import _parse_tool_calls
+        _, _tool_calls = _parse_tool_calls(text or "")
+        tools_called = [tc.name for tc in _tool_calls]
+    except Exception:
+        tools_called = []
+
+    recorder.add_record(InferenceRecord(
+        request_id=request_id,
+        call_order=call_order,
+        parallel_group="",
+        is_parallel=False,
+        tool=task or "",
+        model=resolved_model or "",
+        role="aux",
+        subagent_id=None,
+        parent_subagent_id=None,
+        turn_id=turn_id,
+        input_delta=list(messages or []),
+        output_text=text or "",
+        reasoning_text=None,
+        input_tokens=usage.get("prompt_tokens", 0),
+        output_tokens=usage.get("completion_tokens", 0),
+        reasoning_tokens=usage.get("reasoning_tokens", 0),
+        e2e_latency_s=timings.get("e2e_s"),
+        compute_latency_s=timings.get("compute_s"),
+        probe_rows=probe_rows or [],
+        tools_called=tools_called,
+    ))
 
     # Build a minimal response object that auxiliary consumers can read
     class _Msg:

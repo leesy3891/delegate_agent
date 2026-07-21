@@ -268,34 +268,104 @@ class _HFLocalClientShim:
     """
 
     class _Completions:
-        def __init__(self, pool, model: str):
+        def __init__(self, pool, model: str, agent=None):
             self._pool  = pool
             self._model = model
+            self._agent = agent
+            self._last_msg_count = 0
 
         def create(self, *, model=None, messages=None, tools=None, **kwargs):
+            import uuid as _uuid
+
             from agent.hf_local.pool import _load_hf_config
+            from agent.interp.schemas import InferenceRecord
+            from agent.interp.session_recorder import get_current_turn_id, get_recorder
+
             cfg = _load_hf_config()
             capture = cfg.get("profiling_enabled", False)
 
             temperature = kwargs.get("temperature") or 0.0
             max_new_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or None
 
+            # Profiling identity: shared between the worker-side probe rows
+            # (via `meta`) and the InferenceRecord built below, so both refer
+            # to the same request_id/call_order.
+            recorder = get_recorder()
+            turn_id  = get_current_turn_id()
+            request_id = str(_uuid.uuid4())
+            call_order = recorder.next_call_order(turn_id) if turn_id else 0
+
+            agent_ref = self._agent
+            subagent_id = getattr(agent_ref, "_subagent_id", None)
+            parent_subagent_id = getattr(agent_ref, "_parent_subagent_id", None)
+            role = "subagent" if subagent_id else "main"
+            parallel_group = getattr(agent_ref, "_hf_parallel_group", "") or ""
+            is_parallel = bool(getattr(agent_ref, "_hf_is_parallel", False))
+
+            meta = {
+                "request_id":     request_id,
+                "call_order":     call_order,
+                "parallel_group": parallel_group,
+                "is_parallel":    is_parallel,
+                "tool":           "",
+                "model":          self._model,
+            }
+
+            messages_list = messages or []
+            prev_count = self._last_msg_count
+            if len(messages_list) < prev_count:
+                prev_count = 0  # conversation was compressed/reset — treat as fresh
+            input_delta = messages_list[prev_count:]
+            self._last_msg_count = len(messages_list)
+
             text, usage, timings, probe_rows = self._pool.generate(
-                messages or [],
+                messages_list,
                 model_type="llm",
                 sampling={"temperature": temperature, "max_new_tokens": max_new_tokens},
                 capture=capture,
+                meta=meta,
             )
+
+            try:
+                from agent.transports.hf_local import _parse_tool_calls
+                _, _tool_calls = _parse_tool_calls(text or "")
+                tools_called = [tc.name for tc in _tool_calls]
+            except Exception:
+                tools_called = []
+
+            recorder.add_record(InferenceRecord(
+                request_id=request_id,
+                call_order=call_order,
+                parallel_group=parallel_group,
+                is_parallel=is_parallel,
+                tool="",
+                model=self._model,
+                role=role,
+                subagent_id=subagent_id,
+                parent_subagent_id=parent_subagent_id,
+                turn_id=turn_id,
+                input_delta=input_delta,
+                output_text=text or "",
+                reasoning_text=None,
+                input_tokens=usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0),
+                reasoning_tokens=usage.get("reasoning_tokens", 0),
+                e2e_latency_s=timings.get("e2e_s"),
+                compute_latency_s=timings.get("compute_s"),
+                probe_rows=probe_rows or [],
+                tools_called=tools_called,
+            ))
+
             return _HFLocalResponse(text=text, usage=usage, timings=timings, probe_rows=probe_rows)
 
     class _Chat:
-        def __init__(self, pool, model: str):
-            self.completions = _HFLocalClientShim._Completions(pool, model)
+        def __init__(self, pool, model: str, agent=None):
+            self.completions = _HFLocalClientShim._Completions(pool, model, agent=agent)
 
-    def __init__(self, pool, model: str):
+    def __init__(self, pool, model: str, agent=None):
         self._pool = pool
         self._model = model
-        self.chat = _HFLocalClientShim._Chat(pool, model)
+        self.chat = _HFLocalClientShim._Chat(pool, model, agent=agent)
         self.base_url = "hf://local"
 
     def __repr__(self) -> str:
@@ -931,7 +1001,7 @@ def init_agent(
         agent._hf_pool = _hf_pool
         # Expose a chat.completions-like shim so the normal inference loop
         # can call client.chat.completions.create(**kwargs) unchanged.
-        agent.client = _HFLocalClientShim(_hf_pool, agent.model or "")
+        agent.client = _HFLocalClientShim(_hf_pool, agent.model or "", agent=agent)
         agent.api_key = "hf-local-no-key"
         agent._client_kwargs = {}
         if not agent.quiet_mode:

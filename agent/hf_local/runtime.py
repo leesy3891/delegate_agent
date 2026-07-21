@@ -35,6 +35,76 @@ def _split_reasoning(text: str) -> Tuple[str, str]:
     return "", text
 
 
+def _concat_v_states(entries: List[Dict[str, Any]]) -> Optional[Any]:
+    """Concatenate per-forward-pass v_states along the sequence dim.
+
+    Each decode-step forward only projects the *new* token (KV caching means
+    v_proj only ever sees the incremental input), so the full key/value
+    sequence a later step attends over has to be reassembled by concatenating
+    every prior forward's v_states — prefill (full prompt) followed by each
+    single-token decode step, in order.
+    """
+    import torch
+    parts = [e.get("v_states") for e in entries if e.get("v_states") is not None]
+    if not parts:
+        return None
+    return torch.cat(parts, dim=2)
+
+
+def _build_square_attn(entries: List[Dict[str, Any]]) -> Optional[Any]:
+    """Build a (1, n_q_heads, full_seq_len, full_seq_len) causal attention
+    matrix from per-forward-pass attn_weights.
+
+    The prefill entry contributes a (1, n_q, prompt_len, prompt_len) block;
+    each decode-step entry contributes a single (1, n_q, 1, seq_k_so_far)
+    row. Rows are placed at their absolute sequence position and the
+    remaining (not-yet-existing key) columns are left at zero — which is
+    exactly what causal masking already implies, so this is not a fudge,
+    just materializing the same causal attention compute_probe_rows expects
+    from a single "prefill-shaped" capture.
+    """
+    import torch
+    aws = [e.get("attn_weights") for e in entries]
+    if not aws or aws[-1] is None:
+        return None
+    final_seq_len = aws[-1].shape[-1]
+    n_q_heads = aws[-1].shape[1]
+    batch = aws[-1].shape[0]
+
+    combined = torch.zeros(
+        batch, n_q_heads, final_seq_len, final_seq_len,
+        dtype=aws[-1].dtype, device=aws[-1].device,
+    )
+    row = 0
+    for aw in aws:
+        if aw is None:
+            continue
+        q_len = aw.shape[2]
+        k_len = aw.shape[-1]
+        combined[:, :, row:row + q_len, :k_len] = aw
+        row += q_len
+    return combined
+
+
+def _concat_block_outputs(all_steps: Any, layer_idx: int) -> Optional[Any]:
+    """Concatenate per-step block hidden states (prefill + decode) along seq dim.
+
+    ``all_steps`` is ``output.hidden_states``: a tuple of per-generation-step
+    tuples of per-layer tensors. ``all_steps[0]`` is the prefill step (shape
+    (1, prompt_len, d_model) per layer); ``all_steps[1:]`` are decode steps
+    (shape (1, 1, d_model) per layer). Concatenating along dim=1 in order
+    reproduces the residual-stream output for the full generated sequence.
+    """
+    import torch
+    parts = []
+    for step in all_steps:
+        if step and layer_idx + 1 < len(step):
+            parts.append(step[layer_idx + 1])
+    if not parts:
+        return None
+    return torch.cat(parts, dim=1)
+
+
 class LocalModel:
     """Wrapper around a single HF model on one CUDA device."""
 
@@ -160,7 +230,7 @@ class LocalModel:
 
         # Set up capture hooks if needed
         hook_handles: List[Any] = []
-        hook_storage: Dict[int, Dict[str, Any]] = {}
+        hook_storage: Dict[int, List[Dict[str, Any]]] = {}
         if capture:
             hook_handles, hook_storage = register_attention_hooks(self.model, storage=hook_storage)
 
@@ -223,52 +293,83 @@ class LocalModel:
             "compute_s": t_compute_end - t_compute_start,
         }
 
-        # Compute probe rows
+        # Compute probe rows.
+        # hook_storage[layer_idx] is a list of per-forward-pass captures:
+        # index 0 = prefill, index >=1 = decode steps in order (see
+        # capture.py's register_attention_hooks docstring).
         probe_rows: List[Dict[str, Any]] = []
         if capture and hook_storage:
             meta = request_meta or {}
-            # Extract block hidden states for each layer
-            hidden_states_list: List[Any] = []
+            all_steps: Tuple[Any, ...] = ()
             if hasattr(output, "hidden_states") and output.hidden_states:
-                # output_hidden_states returns tuple of tuples (one per generated token)
-                # We want the prefill + decode blocks
-                # Shape: tuple[token_step] of tuple[layer] of (batch, seq, dim)
-                # We'll use the first step (prefill) and all decode steps
-                all_steps = output.hidden_states  # tuple of steps
-                # all_steps[0] = prefill hidden states (tuple of layers)
-                # all_steps[1:] = per-decode-step hidden states
-                if all_steps:
-                    prefill_hs = all_steps[0]  # tuple of layer tensors
-                    hidden_states_list = list(prefill_hs)
+                # output_hidden_states returns tuple of tuples (one per
+                # generation step): all_steps[0] = prefill (tuple of
+                # per-layer tensors), all_steps[1:] = one tuple per decode
+                # step.
+                all_steps = output.hidden_states
 
-            for layer_idx, capture_data in sorted(hook_storage.items()):
-                # Block output: hidden_states[layer_idx + 1] (after the block)
-                block_out = None
-                if layer_idx + 1 < len(hidden_states_list):
-                    block_out = hidden_states_list[layer_idx + 1]
-
-                if block_out is None:
+            for layer_idx, entries in sorted(hook_storage.items()):
+                if not entries:
                     continue
 
-                # Prefill probe
-                rows = compute_probe_rows(
-                    layer_idx=layer_idx,
-                    capture=capture_data,
-                    block_output=block_out,
-                    request_id=meta.get("request_id", ""),
-                    call_order=meta.get("call_order", 0),
-                    parallel_group=meta.get("parallel_group", ""),
-                    is_parallel=meta.get("is_parallel", False),
-                    tool=meta.get("tool", ""),
-                    model=self.model_id,
-                    phase="prefill",
-                    decode_window=decode_window,
-                    probe_mode=probe_mode,
-                )
-                probe_rows.extend(rows)
+                prefill_entry = entries[0]
+                decode_entries = entries[1:]
 
-                # Decode probe (using stored v_states if available)
-                # For decode, we'd need to accumulate hidden states across steps
-                # Simplified: skip decode probe when hidden_states not available
+                # ── Prefill probe: block output = all_steps[0][layer_idx+1] ──
+                prefill_block_out = None
+                if all_steps and all_steps[0] and layer_idx + 1 < len(all_steps[0]):
+                    prefill_block_out = all_steps[0][layer_idx + 1]
+
+                if prefill_block_out is not None:
+                    rows = compute_probe_rows(
+                        layer_idx=layer_idx,
+                        capture=prefill_entry,
+                        block_output=prefill_block_out,
+                        request_id=meta.get("request_id", ""),
+                        call_order=meta.get("call_order", 0),
+                        parallel_group=meta.get("parallel_group", ""),
+                        is_parallel=meta.get("is_parallel", False),
+                        tool=meta.get("tool", ""),
+                        model=self.model_id,
+                        phase="prefill",
+                        decode_window=decode_window,
+                        probe_mode=probe_mode,
+                    )
+                    probe_rows.extend(rows)
+
+                # ── Decode probe: reassemble the full causal capture from
+                # every forward pass (prefill + each decode step) so the
+                # attention matmul in kv_probe.py has the real, full key
+                # sequence to attend over, then window it in decode_window
+                # chunks. ──
+                if decode_entries and len(all_steps) > 1:
+                    full_v = _concat_v_states(entries)
+                    full_attn = _build_square_attn(entries)
+                    decode_block_out = _concat_block_outputs(all_steps, layer_idx)
+
+                    if full_v is not None and full_attn is not None and decode_block_out is not None:
+                        decode_capture = {
+                            "attn_weights":   full_attn,
+                            "v_states":       full_v,
+                            "o_proj_weight":  prefill_entry.get("o_proj_weight"),
+                            "num_q_heads":    prefill_entry.get("num_q_heads"),
+                            "num_kv_heads":   prefill_entry.get("num_kv_heads"),
+                            "head_dim":       prefill_entry.get("head_dim"),
+                        }
+                        rows = compute_probe_rows(
+                            layer_idx=layer_idx,
+                            capture=decode_capture,
+                            block_output=decode_block_out,
+                            request_id=meta.get("request_id", ""),
+                            call_order=meta.get("call_order", 0),
+                            parallel_group=meta.get("parallel_group", ""),
+                            is_parallel=meta.get("is_parallel", False),
+                            tool=meta.get("tool", ""),
+                            model=self.model_id,
+                            phase="decode",
+                            decode_window=decode_window,
+                            probe_mode=probe_mode,
+                        )
+                        probe_rows.extend(rows)
 
         return completion_text, usage, timings, probe_rows

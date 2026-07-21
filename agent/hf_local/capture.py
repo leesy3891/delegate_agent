@@ -57,17 +57,28 @@ def _detect_head_dims(module: Any) -> Tuple[Optional[int], Optional[int], Option
 def register_attention_hooks(
     model: Any,
     *,
-    storage: Optional[Dict[int, Dict[str, Any]]] = None,
-) -> Tuple[List[Any], Dict[int, Dict[str, Any]]]:
+    storage: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+) -> Tuple[List[Any], Dict[int, List[Dict[str, Any]]]]:
     """Register forward hooks on all softmax-attention layers.
+
+    ``generate()`` runs one prefill forward followed by N decode-step
+    forwards (one per generated token). Each forward triggers this hook once
+    per layer, so a single-dict-per-layer ``storage`` would have each step
+    overwrite the previous one — by the time generation finishes, only the
+    last decode step's capture would survive. Instead, every forward's
+    capture is *appended* to a per-layer list: ``storage[layer_idx][0]`` is
+    always the prefill capture, ``storage[layer_idx][1:]`` are the decode
+    steps in order. The caller (``runtime.py``) uses this to build both the
+    prefill probe and the decode-window probe from real, distinct tensors.
 
     Args:
         model: A loaded HuggingFace model.
         storage: Optional dict to reuse (cleared on call).
 
     Returns:
-        (handles, storage) where handles is a list of hook handles to remove later,
-        and storage maps layer_idx → captured data dict.
+        (handles, storage) where handles is a list of hook handles to remove
+        later, and storage maps layer_idx -> list of per-forward-pass capture
+        dicts (index 0 = prefill, index >=1 = decode steps in order).
     """
     from agent.interp.kv_probe import is_softmax_attention_layer
 
@@ -82,6 +93,14 @@ def register_attention_hooks(
     # Walk all named modules and find attention layers.
     layer_counter = [0]  # use list for closure mutation
 
+    # v_proj's forward hook fires *before* its owning attention module's own
+    # post-forward hook (v_proj is called from inside attention.forward()),
+    # for every single forward pass. So each layer's v-states land here first
+    # and get consumed (popped) by that same forward's attention-module hook
+    # immediately after — this pairs the two hooks correctly per forward pass
+    # without relying on dict-overwrite timing.
+    pending_v: Dict[int, Any] = {}
+
     def _make_hook(layer_idx: int, module: Any):
         """Return a forward hook that captures attention data for this layer."""
         num_q, num_kv, head_d = _detect_head_dims(module)
@@ -92,11 +111,12 @@ def register_attention_hooks(
                 "num_kv_heads": num_kv,
                 "head_dim":     head_d,
                 "attn_weights": None,
-                "v_states":     None,
+                "v_states":     pending_v.pop(layer_idx, None),
                 "o_proj_weight": None,
             }
 
-            # capture o_proj weight (detach — we only need it for the probe)
+            # capture o_proj weight (detach — we only need it for the probe).
+            # Static across forwards, but cheap enough to recapture each time.
             o_proj = getattr(mod, "o_proj", None) or getattr(mod, "out_proj", None)
             if o_proj is not None and hasattr(o_proj, "weight"):
                 data["o_proj_weight"] = o_proj.weight.detach()
@@ -117,10 +137,7 @@ def register_attention_hooks(
                         except Exception:
                             pass
 
-            # Capture V states via a sub-hook on the value projection
-            # We re-hook the v_proj at each forward pass to capture in-flight tensors.
-            # The hook is already set up below; storage is filled by it.
-            storage[layer_idx] = data
+            storage.setdefault(layer_idx, []).append(data)
 
         return hook_fn
 
@@ -135,15 +152,14 @@ def register_attention_hooks(
         h = module.register_forward_hook(_make_hook(layer_idx, module))
         handles.append(h)
 
-        # Also hook v_proj to capture value states
+        # Also hook v_proj to capture value states for this same forward pass.
         v_proj = getattr(module, "v_proj", None)
         if v_proj is not None:
             _layer_idx = layer_idx  # capture in closure
 
             def _make_v_hook(lidx: int):
                 def v_hook_fn(mod, inputs, output):
-                    if lidx in storage:
-                        storage[lidx]["v_states"] = output.detach()
+                    pending_v[lidx] = output.detach()
                 return v_hook_fn
 
             vh = v_proj.register_forward_hook(_make_v_hook(_layer_idx))

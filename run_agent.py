@@ -351,6 +351,23 @@ def _safe_session_filename_component(session_id: str) -> str:
     return f"{sanitized}_{digest}"
 
 
+def _hf_local_profiling_meta(agent) -> tuple:
+    """Best-effort (llm_model_id, llm_config, vlm_model_id, vlm_config) for
+    SessionRecorder.start_turn(). Cheap: reads config.yaml only, never
+    imports torch/transformers (those stay inside HF worker processes).
+    """
+    try:
+        from hermes_cli.config import load_config
+        hf_cfg = load_config().get("hf_local") or {}
+    except Exception:
+        hf_cfg = {}
+    llm_cfg = dict(hf_cfg.get("llm") or {})
+    vlm_cfg = dict(hf_cfg.get("vlm") or {})
+    llm_model_id = llm_cfg.get("model") or getattr(agent, "model", "") or ""
+    vlm_model_id = vlm_cfg.get("model") or None
+    return llm_model_id, llm_cfg, vlm_model_id, vlm_cfg
+
+
 class _StreamErrorEvent(Exception):
     """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
 
@@ -5755,17 +5772,49 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(
-            self,
-            user_message,
-            system_message,
-            conversation_history,
-            task_id,
-            stream_callback,
-            persist_user_message,
-            persist_user_timestamp=persist_user_timestamp,
-            moa_config=moa_config,
+        from agent.interp.session_recorder import (
+            get_recorder,
+            get_current_turn_id,
+            set_current_turn_id,
+            clear_current_turn_id,
         )
+        import uuid as _uuid
+
+        # Only the outermost turn (no ambient turn_id yet on this thread)
+        # opens/closes an HF-local profiling turn. Nested calls — delegated
+        # sub-agents whose thread inherited the parent's turn_id (see
+        # tools/delegate_tool.py), or a subagent's own follow-up turns —
+        # reuse the ambient turn instead of starting a new one. This is a
+        # no-op (NoOpRecorder) unless profiling.enabled=true.
+        _owns_turn = not get_current_turn_id()
+        _turn_id = ""
+        if _owns_turn:
+            _turn_id = _uuid.uuid4().hex
+            _llm_id, _llm_cfg, _vlm_id, _vlm_cfg = _hf_local_profiling_meta(self)
+            get_recorder().start_turn(
+                _turn_id,
+                _llm_id,
+                vlm_model_id=_vlm_id,
+                llm_config=_llm_cfg,
+                vlm_config=_vlm_cfg,
+            )
+            set_current_turn_id(_turn_id)
+        try:
+            return run_conversation(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                task_id,
+                stream_callback,
+                persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                moa_config=moa_config,
+            )
+        finally:
+            if _owns_turn:
+                get_recorder().complete_turn(_turn_id)
+                clear_current_turn_id()
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

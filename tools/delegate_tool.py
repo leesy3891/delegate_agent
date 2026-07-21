@@ -1736,6 +1736,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    parent_turn_id: str = "",
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -1933,6 +1934,13 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            # Propagate the HF-local profiling turn id into this new thread —
+            # contextvars don't cross thread boundaries on their own, so the
+            # child's HF inference calls would otherwise see no ambient turn
+            # and (incorrectly) open a turn of their own.
+            if parent_turn_id:
+                from agent.interp.session_recorder import set_current_turn_id
+                set_current_turn_id(parent_turn_id)
             return child.run_conversation(
                 user_message=goal,
                 task_id=child_task_id,
@@ -2293,6 +2301,17 @@ def _run_single_child(
         if _subagent_id:
             _unregister_subagent(_subagent_id)
 
+        # HF-local profiling completion barrier: this child is done (however
+        # it ended — success, error, or timeout), so release the pending slot
+        # registered for it in _execute_and_aggregate(). Pairs 1:1 with the
+        # register_pending() count there. No-op under NoOpRecorder.
+        if parent_turn_id:
+            try:
+                from agent.interp.session_recorder import get_recorder as _get_recorder
+                _get_recorder().complete_pending(parent_turn_id, 1)
+            except Exception:
+                logger.debug("HF profiling complete_pending failed", exc_info=True)
+
         if child_pool is not None and leased_cred_id is not None:
             try:
                 child_pool.release_lease(leased_cred_id)
@@ -2379,6 +2398,14 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    # HF-local profiling: capture the ambient turn id on THIS thread (the
+    # parent's tool-execution thread) before any work hands off to a
+    # background/executor thread — contextvars aren't inherited by new
+    # threads, so this must be read here and threaded through explicitly.
+    # No-op (empty string) when profiling is disabled or hf_local is unused.
+    from agent.interp.session_recorder import get_current_turn_id as _get_current_turn_id
+    _parent_turn_id = _get_current_turn_id()
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -2491,6 +2518,14 @@ def delegate_task(
 
     _parent_tool_names = list(_model_tools._last_resolved_tool_names)
 
+    # HF-local profiling: mark children of a multi-task batch as a parallel
+    # fan-out group so their InferenceRecords share a parallel_group key.
+    _hf_is_parallel = n_tasks > 1
+    _hf_parallel_group = ""
+    if _hf_is_parallel:
+        import uuid as _hf_uuid
+        _hf_parallel_group = _hf_uuid.uuid4().hex
+
     # Build all child agents on the main thread (thread-safe construction)
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
@@ -2521,6 +2556,9 @@ def delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
+            # HF-local profiling identity — read by _HFLocalClientShim.create().
+            child._hf_parallel_group = _hf_parallel_group
+            child._hf_is_parallel = _hf_is_parallel
             children.append((i, t, child))
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
@@ -2536,10 +2574,18 @@ def delegate_task(
         results block. That is the contract: fan-out runs in the background,
         waits on each other, and returns together.
         """
+        # HF-local profiling completion barrier: the parent turn (if any)
+        # must not flush until every child spawned here has reported back —
+        # each _run_single_child() call below pairs with exactly one
+        # complete_pending() in its own finally block, win or lose.
+        if _parent_turn_id:
+            from agent.interp.session_recorder import get_recorder as _get_recorder
+            _get_recorder().register_pending(_parent_turn_id, count=n_tasks)
+
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child(_i, _t["goal"], child, parent_agent, parent_turn_id=_parent_turn_id)
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2559,6 +2605,7 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        parent_turn_id=_parent_turn_id,
                     )
                     futures[future] = i
 

@@ -30,6 +30,7 @@ InferenceRecord before calling add_record().
 
 from __future__ import annotations
 
+import contextvars
 import csv
 import json
 import logging
@@ -47,6 +48,32 @@ _KST = timezone(timedelta(hours=9))
 
 _RECORDER_LOCK = threading.Lock()
 _RECORDER_SINGLETON: Optional["SessionRecorder"] = None
+
+# Process-local "current turn" context. Set by the top-level turn entry point
+# (run_agent.py's AIAgent.run_conversation) and read by every HF-local call
+# site so InferenceRecord.turn_id can be filled in without threading a turn_id
+# parameter through every call. Delegation sub-agents run as threads in the
+# same process, so the value must be explicitly propagated across the thread
+# boundary (contextvars are not inherited by new threads automatically) —
+# see tools/delegate_tool.py's child-thread entry point.
+_current_turn_id_var: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "hf_local_current_turn_id", default=""
+)
+
+
+def set_current_turn_id(turn_id: str) -> None:
+    """Bind the current turn id for this thread's contextvar chain."""
+    _current_turn_id_var.set(turn_id or "")
+
+
+def get_current_turn_id() -> str:
+    """Return the turn id bound for this thread, or "" if none is active."""
+    return _current_turn_id_var.get()
+
+
+def clear_current_turn_id() -> None:
+    """Clear the current turn id (call when a top-level turn completes)."""
+    _current_turn_id_var.set("")
 
 
 def get_recorder() -> "SessionRecorder":
@@ -119,6 +146,10 @@ class SessionRecorder:
     def set_layer_inventory(self, turn_id: str, inventory: List[Any]) -> None:
         pass
 
+    def next_call_order(self, turn_id: str) -> int:
+        """Return the next monotonic call_order for this turn (thread-safe)."""
+        return 0
+
 
 class NoOpRecorder(SessionRecorder):
     """Recorder used when profiling.enabled=false. Completely inert."""
@@ -171,6 +202,15 @@ class ActiveRecorder(SessionRecorder):
             return
         with state.lock:
             state.layer_inventory = list(inventory)
+
+    def next_call_order(self, turn_id: str) -> int:
+        with self._lock:
+            state = self._turns.get(turn_id)
+        if state is None:
+            return 0
+        with state.lock:
+            state.call_order_counter += 1
+            return state.call_order_counter
 
     def register_pending(self, turn_id: str, count: int = 1) -> None:
         with self._lock:
@@ -364,4 +404,5 @@ class _TurnState:
         self.layer_inventory: List[Any] = []
         self.pending: int    = 0      # pending child/aux completions
         self.main_done: bool = False
+        self.call_order_counter: int = 0
         self.lock            = threading.Lock()
