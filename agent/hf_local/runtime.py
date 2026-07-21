@@ -189,6 +189,7 @@ class LocalModel:
         request_meta: Optional[Dict[str, Any]] = None,
         probe_mode: str = "output_contribution",
         decode_window: int = 64,
+        tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[str, Dict[str, int], Dict[str, float], List[Dict[str, Any]]]:
         """Run the model on `messages` and return (text, usage, timings, probe_rows).
 
@@ -200,6 +201,11 @@ class LocalModel:
             request_meta: Metadata for probe rows (request_id, call_order, etc.)
             probe_mode: "output_contribution" | "value_projection"
             decode_window: Decode-phase aggregation window size.
+            tools: OpenAI-format tool definitions, forwarded to
+                ``tokenizer.apply_chat_template(tools=...)`` so Qwen3/3.5 can
+                see and emit ``<tool_call>`` blocks. Ignored (with a warning)
+                for VLM requests — the processor's chat template does not
+                support a ``tools`` kwarg; tool use is LLM-slot only.
 
         Returns:
             text:        Generated text (completion only, without <think> block).
@@ -216,13 +222,24 @@ class LocalModel:
 
         # Build input
         if self.is_vlm and self.processor is not None:
+            if tools:
+                logger.warning(
+                    "LocalModel.generate: tools were provided for a VLM request "
+                    "(model=%s) but the processor's chat template does not "
+                    "support tools — ignoring them. Tool use is LLM-slot only.",
+                    self.model_id,
+                )
             inputs = self.processor.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
                 return_tensors="pt"
             ).to(self.device)
         else:
+            template_kwargs: Dict[str, Any] = {}
+            if tools:
+                template_kwargs["tools"] = tools
             text_input = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True,
+                **template_kwargs,
             )
             inputs = self.tokenizer(text_input, return_tensors="pt").to(self.device)
 

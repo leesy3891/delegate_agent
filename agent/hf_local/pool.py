@@ -185,6 +185,7 @@ class HFWorkerPool:
         sampling: Optional[Dict[str, Any]] = None,
         capture: bool = False,
         meta: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
         timeout: float = 600.0,
     ) -> Tuple[str, Dict[str, int], Dict[str, float], List[Dict[str, Any]]]:
         """Submit a generate request to an available slot and wait for result.
@@ -198,6 +199,9 @@ class HFWorkerPool:
             sampling:   Dict with temperature, max_new_tokens.
             capture:    Whether to run KV/attention capture.
             meta:       Metadata for probe rows.
+            tools:      OpenAI-format tool definitions, forwarded to the
+                        worker's apply_chat_template(tools=...) call. Ignored
+                        for model_type="vlm" (see runtime.py).
             timeout:    Total timeout in seconds.
 
         Returns (text, usage, timings, probe_rows).
@@ -225,6 +229,7 @@ class HFWorkerPool:
                 "sampling":   sampling or {},
                 "capture":    capture,
                 "meta":       meta or {},
+                "tools":      tools,
             })
 
             remaining = deadline - time.time()

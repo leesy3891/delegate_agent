@@ -324,6 +324,7 @@ class _HFLocalClientShim:
                 sampling={"temperature": temperature, "max_new_tokens": max_new_tokens},
                 capture=capture,
                 meta=meta,
+                tools=tools,
             )
 
             try:

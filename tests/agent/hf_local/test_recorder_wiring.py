@@ -27,7 +27,7 @@ def _fake_pool(probe_rows):
     """A stand-in for HFWorkerPool exposing only .generate()."""
     pool = SimpleNamespace()
 
-    def generate(messages, *, model_type="llm", sampling=None, capture=False, meta=None, timeout=600.0):
+    def generate(messages, *, model_type="llm", sampling=None, capture=False, meta=None, tools=None, timeout=600.0):
         return (
             "hello from hf-local",
             {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15, "reasoning_tokens": 0},

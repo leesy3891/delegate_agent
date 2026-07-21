@@ -6374,6 +6374,8 @@ def _call_hf_local_aux(
     model: Optional[str],
     temperature: Optional[float],
     max_tokens: Optional[int],
+    *,
+    tools: Optional[list] = None,
 ) -> Any:
     """Route an auxiliary call to HFWorkerPool.
 
@@ -6383,6 +6385,10 @@ def _call_hf_local_aux(
 
     Vision tasks route to the VLM slot; all others use the LLM slot.
     Heavy imports (torch/transformers) stay inside worker processes.
+
+    `tools` is optional — most aux tasks (compression, title_generation,
+    etc.) don't use tool-calling, but some (e.g. mcp) may. It's forwarded
+    unchanged to pool.generate(); runtime.py ignores it for VLM requests.
     """
     import uuid as _uuid
 
@@ -6420,6 +6426,7 @@ def _call_hf_local_aux(
         },
         capture=capture,
         meta=meta,
+        tools=tools,
     )
 
     try:
@@ -6549,6 +6556,7 @@ def call_llm(
             model=resolved_model,
             temperature=temperature,
             max_tokens=max_tokens,
+            tools=tools,
         )
 
     if task == "vision":
@@ -7167,6 +7175,27 @@ async def async_call_llm(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+
+    # HF-local backend: same routing as the sync call_llm() above, just
+    # ahead of the vision-provider resolution below — "hf-local" isn't a
+    # known vision provider, so without this branch a vision task would
+    # fall through to resolve_vision_provider_client("hf-local", ...),
+    # fail to build a client, and silently fall back to the auto/main
+    # provider instead of reaching the VLM slot.
+    # _call_hf_local_aux() is a blocking call (it waits on pool.generate()),
+    # so it runs on a worker thread via asyncio.to_thread() to avoid
+    # blocking the event loop.
+    if resolved_provider == "hf-local":
+        import asyncio
+        return await asyncio.to_thread(
+            _call_hf_local_aux,
+            task=task,
+            messages=messages,
+            model=resolved_model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+        )
 
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(

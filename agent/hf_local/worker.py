@@ -10,7 +10,8 @@ Only compact probe rows + text + usage cross IPC (heavy tensors stay on-GPU).
 
 Message protocol (multiprocessing.Queue):
   Request:  {"type": "generate", "messages": [...], "model_type": "llm"|"vlm",
-             "sampling": {...}, "capture": bool, "meta": {...}, "request_id": str}
+             "sampling": {...}, "capture": bool, "meta": {...}, "tools": [...]|None,
+             "request_id": str}
   Response: {"ok": True, "text": str, "usage": {...}, "timings": {...}, "probe_rows": [...]}
             {"ok": False, "error": str}
 
@@ -98,6 +99,7 @@ def worker_main(
         sampling    = msg.get("sampling", {})
         capture     = bool(msg.get("capture", False))
         meta        = msg.get("meta", {})
+        tools       = msg.get("tools")
 
         try:
             if model_type == "vlm":
@@ -124,6 +126,7 @@ def worker_main(
                 request_meta=meta,
                 probe_mode=probe_mode,
                 decode_window=decode_window,
+                tools=tools,
             )
 
             resp_queue.put({
